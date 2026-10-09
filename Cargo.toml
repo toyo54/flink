@@ -1,0 +1,13 @@
+[package]
+name = "flink"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[profile.release]
+opt-level = "z"     # Optimize for size ('z' is more aggressive than 's')
+lto = true          # Enable Link Time Optimization (removes dead code)
+codegen-units = 1   # Compile strictly sequentially (allows better optimization)
+panic = "abort"     # Crash immediately on panic (removes stack unwinding logic)
+strip = true        # Automatically strip symbols from the binary
