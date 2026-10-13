@@ -89,10 +89,7 @@ impl<'a> Link<'a> {
 
 impl Display for Link<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let path = match self.path.to_str() {
-            Some(path) => path,
-            None => "",
-        };
+        let path = self.path.to_str().unwrap_or_default();
 
         write!(
             f,
@@ -126,18 +123,20 @@ impl Table<'_> {
 
             let mut split = line.split_whitespace();
 
-            let link_name = split
-                .next()
-                .ok_or(FlinkError::TableError(format!("Invalid table structure")))?;
+            let link_name = split.next().ok_or(FlinkError::TableError(
+                "Invalid table structure".to_string(),
+            ))?;
 
             // check for separator
             if split.next() != Some("--") {
-                return Err(FlinkError::TableError(format!("Invalid table structure")));
+                return Err(FlinkError::TableError(
+                    "Invalid table structure".to_string(),
+                ));
             }
 
-            let path = split
-                .next()
-                .ok_or(FlinkError::TableError(format!("Invalid table structure")))?;
+            let path = split.next().ok_or(FlinkError::TableError(
+                "Invalid table structure".to_string(),
+            ))?;
 
             map.insert(link_name.to_string(), PathBuf::from(path));
         }
@@ -161,7 +160,7 @@ impl Table<'_> {
     ///This functions returns true if the provided
     ///link name is present inside the table
     fn is_present(&self, link_name: &str) -> bool {
-        self.map.get(link_name).is_some()
+        self.map.contains_key(link_name)
     }
 
     fn add_link(&mut self, name: &str, path: &Path) -> Result<(), FlinkError> {
@@ -228,8 +227,7 @@ fn expand_tilde(path: &Path) -> Cow<'_, Path> {
         return Cow::Owned(home);
     }
 
-    if path_str.starts_with("~/") {
-        let suffix = &path_str[2..];
+    if let Some(suffix) = path_str.strip_prefix("~/") {
         return Cow::Owned(home.join(suffix));
     }
 
@@ -240,9 +238,9 @@ fn expand_tilde(path: &Path) -> Cow<'_, Path> {
 fn read_file(path: &Path) -> Result<String, FlinkError> {
     // safety check
     if !path.is_file() {
-        return Err(FlinkError::UnsafePath(format!(
-            "The provided path is unsafe"
-        )));
+        return Err(FlinkError::UnsafePath(
+            "The provided path is unsafe".to_string(),
+        ));
     }
 
     let mut file = File::open(path)?;
@@ -265,7 +263,7 @@ fn getlinks<'a>(table: &'a Table, str: &'a str) -> impl Iterator<Item = Link<'a>
             None => Path::new(""),
         };
 
-        let path = expand_tilde(&path);
+        let path = expand_tilde(path);
         let valid = path.exists();
         Some(Link::from(link_name, path, valid))
     })
@@ -408,7 +406,7 @@ fn run() -> Result<(), FlinkError> {
     match op {
         Operations::File(val, tbl) => {
             let path = Path::new(&tbl);
-            let table = Table::read(&path)?;
+            let table = Table::read(path)?;
 
             // file
             let path = expand_tilde(Path::new(&val));
@@ -421,7 +419,7 @@ fn run() -> Result<(), FlinkError> {
         Operations::Link(val, tbl) => {
             // table
             let path = Path::new(&tbl);
-            let table = Table::read(&path)?;
+            let table = Table::read(path)?;
 
             // obtains path from a link name
             let path = table.get_path(&val).ok_or(FlinkError::TableError(format!(
@@ -440,7 +438,7 @@ fn run() -> Result<(), FlinkError> {
         Operations::Table(tbl_op, tbl_path) => {
             // table
             let path = Path::new(&tbl_path);
-            let mut table = Table::read(&path)?;
+            let mut table = Table::read(path)?;
 
             match tbl_op {
                 TableOperations::Add(name, path) => {
@@ -484,7 +482,7 @@ mod tests {
     fn from_file() {
         // table
         let path = Path::new(TABLE_PATH);
-        let table = Table::read(&path).unwrap();
+        let table = Table::read(path).unwrap();
 
         // file
         let path = Path::new("./my_note.txt");
@@ -499,7 +497,7 @@ mod tests {
     fn from_link() {
         // table
         let path = Path::new(TABLE_PATH);
-        let table = Table::read(&path).unwrap();
+        let table = Table::read(path).unwrap();
 
         // obtain path from a link name and read the file
         let ln = "note_personali";
