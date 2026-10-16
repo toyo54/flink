@@ -3,8 +3,8 @@ use std::{
     collections::HashMap,
     env,
     fmt::{self, Display},
-    fs::{File, OpenOptions},
-    io::{self, Error as IOError, Read, Write},
+    fs::{self, OpenOptions},
+    io::{self, Error as IOError, Write},
     path::{Path, PathBuf},
     process,
 };
@@ -59,8 +59,8 @@ struct Link<'a> {
     valid: bool,
 }
 
-struct Table<'a> {
-    path: &'a Path,
+struct Table {
+    path: PathBuf,
     map: HashMap<String, PathBuf>,
 }
 
@@ -99,15 +99,13 @@ impl Display for Link<'_> {
     }
 }
 
-impl Table<'_> {
+impl Table {
     /// This method opens the provided **table_path** and returns an instance of it
-    fn read(user_path: &Path) -> Result<Table<'_>, FlinkError> {
+    fn read(user_path: &Path) -> Result<Table, FlinkError> {
         let expanded = expand_tilde(user_path);
 
         // opens the file and reads the content
-        let mut file = File::open(expanded)?;
-        let mut content = String::new();
-        file.read_to_string(&mut content)?;
+        let content = fs::read_to_string(&expanded)?;
 
         // creates the map
         let mut map: HashMap<String, PathBuf> = HashMap::new();
@@ -142,7 +140,7 @@ impl Table<'_> {
         }
 
         Ok(Table {
-            path: user_path,
+            path: expanded.to_path_buf(),
             map,
         })
     }
@@ -174,7 +172,7 @@ impl Table<'_> {
         let mut file = OpenOptions::new()
             .append(true)
             .create(true)
-            .open(self.path)?;
+            .open(&self.path)?;
 
         let Some(path) = path.to_str() else {
             return Err(FlinkError::UnsafePath(format!(
@@ -195,15 +193,17 @@ impl Table<'_> {
                 name
             )));
         }
-        self.map.remove(name);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(self.path)?;
 
-        for (k, v) in self.map.iter() {
-            writeln!(file, "{} -- {}", k, v.display())?;
-        }
+        // TODO: remove the line
+
+        let content = std::fs::read_to_string(&self.path)?;
+        let content: String = content
+            .split_inclusive('\n')
+            .filter(|l| l.split_whitespace().next() != Some(name))
+            .collect();
+
+        std::fs::write(&self.path, content)?;
+        self.map.remove(name);
 
         Ok(())
     }
@@ -243,10 +243,7 @@ fn read_file(path: &Path) -> Result<String, FlinkError> {
         ));
     }
 
-    let mut file = File::open(path)?;
-    let mut buf = String::new();
-    file.read_to_string(&mut buf)?;
-    Ok(buf)
+    Ok(fs::read_to_string(path)?)
 }
 
 /// This function returns a list of all the
@@ -362,7 +359,7 @@ fn get_op() -> Result<Operations, FlinkError> {
 }
 
 /// This function prints the help message to the user
-fn show_info() {
+fn show_info() -> ! {
     println!("flink - File Link Manager");
     println!();
     println!("USAGE:");
@@ -398,9 +395,12 @@ fn show_info() {
 /// provided by the user
 fn run() -> Result<(), FlinkError> {
     // Obtain the operation
-    let Ok(op) = get_op() else {
-        show_info();
-        return Ok(());
+    let op = match get_op() {
+        Ok(op) => op,
+        Err(e) => {
+            eprintln!("Error: {e}\n");
+            show_info();
+        }
     };
 
     match op {
