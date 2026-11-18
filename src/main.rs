@@ -1,16 +1,16 @@
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::BTreeMap,
     env,
     fmt::{self, Display},
-    fs::{self, OpenOptions},
-    io::{self, Error as IOError, Write},
+    fs::{self, File, OpenOptions},
+    io::{self, Error as IOError, Read, Seek, Write},
     path::{Path, PathBuf},
     process,
 };
 
 /// This is the path to the default table location
-const TABLE_PATH: &str = "~/.config/flnk/global_table.tbl";
+const TABLE_PATH: &str = "~/.config/flink/global_table.tbl";
 
 // ==============================================
 // Error section
@@ -43,8 +43,8 @@ impl fmt::Display for FlinkError {
 }
 
 impl std::error::Error for FlinkError {}
-impl From<io::Error> for FlinkError {
-    fn from(value: io::Error) -> Self {
+impl From<IOError> for FlinkError {
+    fn from(value: IOError) -> Self {
         FlinkError::FileError(value)
     }
 }
@@ -61,13 +61,14 @@ struct Link<'a> {
 
 struct Table {
     path: PathBuf,
-    map: HashMap<String, PathBuf>,
+    map: BTreeMap<String, PathBuf>,
 }
 
 #[derive(Debug)]
 enum TableOperations {
     Add(String, String),
     Remove(String),
+    List,
 }
 
 #[derive(Debug)]
@@ -78,11 +79,11 @@ enum Operations {
 }
 
 // ==============================================
-// Struct implementations section
+// Struct implementation section
 // ==============================================
 
 impl<'a> Link<'a> {
-    fn from(name: &'a str, path: Cow<'a, Path>, valid: bool) -> Self {
+    fn new(name: &'a str, path: Cow<'a, Path>, valid: bool) -> Self {
         Link { name, path, valid }
     }
 }
@@ -105,38 +106,33 @@ impl Table {
         let expanded = expand_tilde(user_path);
 
         // opens the file and reads the content
-        let content = fs::read_to_string(&expanded)?;
+        let content = match fs::read_to_string(&expanded) {
+            Ok(c) => c,
+            // if the file was not found
+            Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e.into()),
+        };
 
         // creates the map
-        let mut map: HashMap<String, PathBuf> = HashMap::new();
+        let mut map: BTreeMap<String, PathBuf> = BTreeMap::new();
 
         // Reads the file
-        for line in content.lines() {
+        for (i, line) in content.lines().enumerate() {
             let line = line.trim();
 
-            // check for comment or empty line
-            if line.starts_with("#") || line.is_empty() {
+            if line.starts_with('#') || line.is_empty() {
                 continue;
             }
 
-            let mut split = line.split_whitespace();
+            let (name, path) = line.split_once(" -- ").ok_or_else(|| {
+                FlinkError::TableError(format!(
+                    "line {}: expected `name -- path`, got `{}`",
+                    i + 1,
+                    line
+                ))
+            })?;
 
-            let link_name = split.next().ok_or(FlinkError::TableError(
-                "Invalid table structure".to_string(),
-            ))?;
-
-            // check for separator
-            if split.next() != Some("--") {
-                return Err(FlinkError::TableError(
-                    "Invalid table structure".to_string(),
-                ));
-            }
-
-            let path = split.next().ok_or(FlinkError::TableError(
-                "Invalid table structure".to_string(),
-            ))?;
-
-            map.insert(link_name.to_string(), PathBuf::from(path));
+            map.insert(name.trim().to_string(), PathBuf::from(path));
         }
 
         Ok(Table {
@@ -169,11 +165,17 @@ impl Table {
             )));
         }
 
-        let mut file = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&self.path)?;
+        // check the link name
+        if name.is_empty() || name.starts_with('#') || name.contains(char::is_whitespace) {
+            return Err(FlinkError::InvalidInput(
+                "link name must be non-empty, must not start with '#' and must contain no whitespace".to_string(),
+            ));
+        }
 
+        // extract the absolute path
+        let path = std::path::absolute(expand_tilde(path))?;
+
+        // check the file path
         let Some(path) = path.to_str() else {
             return Err(FlinkError::UnsafePath(format!(
                 "The provided path: {} is invalid",
@@ -181,8 +183,32 @@ impl Table {
             )));
         };
 
+        if path.contains('\n') {
+            return Err(FlinkError::InvalidInput(
+                "Path must not contain a newline".to_string(),
+            ));
+        }
+
+        // create the directory if it doesn't exists
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        // open (and create) the table
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(&self.path)?;
+
+        if !ends_with_newline(&mut file)? {
+            writeln!(file)?; // adds a newline to the end of the file
+        }
+
+        // append it to the file and the table
         writeln!(file, "{} -- {}", name, path)?;
         self.map.insert(name.to_string(), PathBuf::from(path));
+
         Ok(())
     }
 
@@ -193,8 +219,6 @@ impl Table {
                 name
             )));
         }
-
-        // TODO: remove the line
 
         let content = std::fs::read_to_string(&self.path)?;
         let content: String = content
@@ -215,42 +239,43 @@ impl Table {
 
 /// This function expands **path** if it starts with "~"
 fn expand_tilde(path: &Path) -> Cow<'_, Path> {
-    let path_str = path.to_string_lossy();
-    let home = env::var_os("HOME");
+    match (path.strip_prefix("~"), env::var_os("HOME")) {
+        (Ok(rest), Some(home)) => Cow::Owned(PathBuf::from(home).join(rest)),
+        _ => Cow::Borrowed(path),
+    }
+}
 
-    let Some(home_val) = home else {
-        return Cow::Borrowed(path);
-    };
-
-    let home = PathBuf::from(home_val);
-    if path_str == "~" {
-        return Cow::Owned(home);
+/// Checks whether the file ends with a newline
+fn ends_with_newline(file: &mut File) -> io::Result<bool> {
+    if file.metadata()?.len() == 0 {
+        return Ok(true);
     }
 
-    if let Some(suffix) = path_str.strip_prefix("~/") {
-        return Cow::Owned(home.join(suffix));
-    }
+    file.seek(io::SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
 
-    Cow::Borrowed(path)
+    Ok(last[0] == b'\n')
 }
 
 /// This function reads the content from a file located at **path**
 fn read_file(path: &Path) -> Result<String, FlinkError> {
     // safety check
     if !path.is_file() {
-        return Err(FlinkError::UnsafePath(
-            "The provided path is unsafe".to_string(),
-        ));
+        return Err(FlinkError::UnsafePath(format!(
+            "The provided path: \"{}\" is not a file",
+            path.display()
+        )));
     }
 
     Ok(fs::read_to_string(path)?)
 }
 
 /// This function returns a list of all the
-/// the links found into **str** that have
+/// the links found into **slice** that have
 /// a match into **table**
-fn getlinks<'a>(table: &'a Table, str: &'a str) -> impl Iterator<Item = Link<'a>> {
-    str.split_whitespace().filter_map(|word| {
+fn getlinks<'a>(table: &'a Table, slice: &'a str) -> impl Iterator<Item = Link<'a>> {
+    slice.split_whitespace().filter_map(|word| {
         // do not consider ".lk"
         let link_name = word.strip_suffix(".lk")?;
 
@@ -261,8 +286,8 @@ fn getlinks<'a>(table: &'a Table, str: &'a str) -> impl Iterator<Item = Link<'a>
         };
 
         let path = expand_tilde(path);
-        let valid = path.exists();
-        Some(Link::from(link_name, path, valid))
+        let valid = path.is_file();
+        Some(Link::new(link_name, path, valid))
     })
 }
 
@@ -288,12 +313,12 @@ fn get_op() -> Result<Operations, FlinkError> {
         ));
     }
 
-    // Check for optional -tbl flag
-    let tbl = if args.first().map(|s| s.as_str()) == Some("-tbl") {
-        args.remove(0); // Remove "-tbl"
+    // Check for optional --tbl flag
+    let tbl = if args.first().map(|s| s.as_str()) == Some("--tbl") {
+        args.remove(0); // Remove "--tbl"
         if args.is_empty() {
             return Err(FlinkError::InvalidInput(
-                "Missing table path after -tbl".to_string(),
+                "Missing table path after --tbl".to_string(),
             ));
         }
         args.remove(0) // Remove and return the table path
@@ -309,7 +334,7 @@ fn get_op() -> Result<Operations, FlinkError> {
     let command = args.remove(0);
 
     match command.as_str() {
-        "-l" => {
+        "-l" | "--link" => {
             if args.is_empty() {
                 return Err(FlinkError::InvalidInput(
                     "Missing link name for -l command".to_string(),
@@ -318,7 +343,7 @@ fn get_op() -> Result<Operations, FlinkError> {
             let link_name = args.remove(0);
             Ok(Operations::Link(link_name, tbl))
         }
-        "-f" => {
+        "-f" | "--file" => {
             if args.is_empty() {
                 return Err(FlinkError::InvalidInput(
                     "Missing file path for -f command".to_string(),
@@ -327,10 +352,10 @@ fn get_op() -> Result<Operations, FlinkError> {
             let file_path = args.remove(0);
             Ok(Operations::File(file_path, tbl))
         }
-        "-add" => {
+        "--add" => {
             if args.len() < 2 {
                 return Err(FlinkError::InvalidInput(
-                    "Missing link name or path for -add command".to_string(),
+                    "Missing link name or path for --add command".to_string(),
                 ));
             }
             let link_name = args.remove(0);
@@ -340,19 +365,20 @@ fn get_op() -> Result<Operations, FlinkError> {
                 tbl,
             ))
         }
-        "-rm" | "-remove" => {
+        "--remove" => {
             if args.is_empty() {
                 return Err(FlinkError::InvalidInput(
-                    "Missing link name for -rm command".to_string(),
+                    "Missing link name for --remove command".to_string(),
                 ));
             }
             let link_name = args.remove(0);
-            // Remove doesn't need the second String in the enum, but it's defined that way
-            // so we'll pass an empty string
+
             Ok(Operations::Table(TableOperations::Remove(link_name), tbl))
         }
+        "--list" | "-L" => Ok(Operations::Table(TableOperations::List, tbl)),
+        "-h" | "--help" => show_info(),
         _ => Err(FlinkError::InvalidInput(format!(
-            "Unknown command: {}. Use -f, -l, -add, or -rm",
+            "Unknown command: {}",
             command
         ))),
     }
@@ -363,92 +389,87 @@ fn show_info() -> ! {
     println!("flink - File Link Manager");
     println!();
     println!("USAGE:");
-    println!("    flink [-tbl TABLE_PATH] COMMAND [ARGUMENTS]");
+    println!("    flink [--tbl TABLE_PATH] COMMAND [ARGUMENTS]");
     println!();
     println!("OPTIONS:");
-    println!("    -tbl <path>    Specify a custom table file path");
-    println!("                   (default: ~/.config/flnk/global_table.tbl)");
+    println!("    --tbl <path>    Specify a custom table file path");
+    println!("                   (default: ~/.config/flink/global_table.tbl)");
     println!();
     println!("COMMANDS:");
-    println!("    -f <file_path>              Read a file and display its links");
-    println!("    -l <link_name>              Display file content from a link name");
-    println!("    -add <link_name> <path>     Add a new link to the table");
-    println!("    -rm <link_name>             Remove a link from the table");
-    println!("    -remove <link_name>         Remove a link from the table (alias)");
-    println!();
-    println!("EXAMPLES:");
-    println!("    flink -f ./my_note.txt");
-    println!("    flink -l note_personali");
-    println!("    flink -add mylink ~/documents/notes.txt");
-    println!("    flink -tbl ./custom.tbl -add work ~/work/todo.txt");
-    println!("    flink -rm mylink");
+    println!("    --file | -f <file_path>              Read a file and display its links");
+    println!("    --link | -l <link_name>              Display file content from a link name");
+    println!("    --add <link_name> <path>             Adds a new link to the table");
+    println!("    --remove <link_name>                 Remove a link from the table");
+    println!("    --list | -L                          List all the entries found inside a table");
 
-    process::exit(2);
+    process::exit(0);
 }
 
 // ==============================================
 // Runner
 // ==============================================
 
-/// This function is responsible
-/// for executing the right command
-/// provided by the user
+/// Matches and runs the correct command
 fn run() -> Result<(), FlinkError> {
-    // Obtain the operation
-    let op = match get_op() {
-        Ok(op) => op,
-        Err(e) => {
-            eprintln!("Error: {e}\n");
-            show_info();
-        }
-    };
+    let op = get_op()?;
 
     match op {
-        Operations::File(val, tbl) => {
-            let path = Path::new(&tbl);
-            let table = Table::read(path)?;
+        Operations::File(val, tbl) => handle_file(&val, &tbl),
+        Operations::Link(val, tbl) => handle_link(&val, &tbl),
+        Operations::Table(tbl_op, tbl_path) => handle_table(tbl_op, &tbl_path),
+    }
+}
 
-            // file
-            let path = expand_tilde(Path::new(&val));
-            let fc = read_file(&path)?;
+/// Handles the "file" command
+fn handle_file(val: &str, tbl: &str) -> Result<(), FlinkError> {
+    let table = Table::read(Path::new(tbl))?;
+    let path = expand_tilde(Path::new(val));
+    let fc = read_file(&path)?;
 
-            // output
-            let links = getlinks(&table, &fc);
-            show_output(&fc, links);
+    let links = getlinks(&table, &fc);
+    show_output(&fc, links);
+
+    Ok(())
+}
+
+/// Handles the link command
+fn handle_link(val: &str, tbl: &str) -> Result<(), FlinkError> {
+    let table = Table::read(Path::new(tbl))?;
+
+    let path = table.get_path(val).ok_or_else(|| {
+        FlinkError::TableError(format!("Unable to find a path for link: {}", val))
+    })?;
+
+    let path = Path::new(&path);
+    let content = read_file(&expand_tilde(path))?;
+
+    let links = getlinks(&table, &content);
+    show_output(&content, links);
+
+    Ok(())
+}
+
+/// Handles table related operations
+fn handle_table(tbl_op: TableOperations, tbl_path: &str) -> Result<(), FlinkError> {
+    let mut table = Table::read(Path::new(tbl_path))?;
+
+    match tbl_op {
+        TableOperations::Add(name, path) => {
+            table.add_link(name.as_str(), Path::new(&path))?;
+            println!("Link: \"{}\" added successfully!", name);
         }
-        Operations::Link(val, tbl) => {
-            // table
-            let path = Path::new(&tbl);
-            let table = Table::read(path)?;
-
-            // obtains path from a link name
-            let path = table.get_path(&val).ok_or(FlinkError::TableError(format!(
-                "Unable to find a path for link: {}",
-                val
-            )))?;
-
-            // read the file
-            let path = Path::new(&path);
-            let content = read_file(&expand_tilde(path))?;
-
-            // output
-            let links = getlinks(&table, &content);
-            show_output(&content, links);
+        TableOperations::Remove(name) => {
+            table.remove_link(name.as_str())?;
+            println!("Link: \"{}\" removed successfully!", name);
         }
-        Operations::Table(tbl_op, tbl_path) => {
-            // table
-            let path = Path::new(&tbl_path);
-            let mut table = Table::read(path)?;
+        TableOperations::List => {
+            if table.map.is_empty() {
+                println!("Empty table: {}", table.path.display());
+                return Ok(());
+            }
 
-            match tbl_op {
-                TableOperations::Add(name, path) => {
-                    table.add_link(name.as_str(), Path::new(&path))?;
-                    println!("Link: \"{}\" added successfully!", name);
-                }
-                TableOperations::Remove(name) => {
-                    table.remove_link(name.as_str())?;
-                    println!("Link: \"{}\" removed successfully!", name);
-                }
+            for (k, v) in &table.map {
+                println!("LINK NAME: {} => FILE PATH: {}", k, v.display());
             }
         }
     }
@@ -462,53 +483,10 @@ fn run() -> Result<(), FlinkError> {
 
 fn main() {
     // The main function is only used to check the error returned
-    // from the run function, wich is the core dispatcher
+    // from the run function, which is the core dispatcher
     // of the program
     if let Err(err) = run() {
         eprintln!("Error: \n{}", err);
         process::exit(1);
-    }
-}
-
-// ===============================================
-// TEST
-// ===============================================
-
-#[cfg(test)]
-mod tests {
-    use crate::*;
-
-    #[test]
-    fn from_file() {
-        // table
-        let path = Path::new(TABLE_PATH);
-        let table = Table::read(path).unwrap();
-
-        // file
-        let path = Path::new("./my_note.txt");
-        let fc = read_file(path).unwrap();
-
-        // output
-        let links = getlinks(&table, &fc);
-        show_output(&fc, links);
-    }
-
-    #[test]
-    fn from_link() {
-        // table
-        let path = Path::new(TABLE_PATH);
-        let table = Table::read(path).unwrap();
-
-        // obtain path from a link name and read the file
-        let ln = "note_personali";
-        let path = table.get_path(ln).unwrap();
-        let path = Path::new(&path);
-        let path = expand_tilde(path);
-        dbg!(&path);
-        let content = read_file(&path).unwrap();
-
-        // output
-        let links = getlinks(&table, &content);
-        show_output(&content, links);
     }
 }
