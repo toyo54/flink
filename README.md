@@ -20,7 +20,7 @@ Because links point at names rather than paths, you can move a file and update o
 Requires Rust 1.79 or newer (`std::path::absolute`). Unix-like systems only for now, since `~` expansion relies on `$HOME`.
 
 ```
-git clone <repo-url>
+git clone https://github.com/toyo54/flink.git
 cd flink
 cargo install --path .
 ```
