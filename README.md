@@ -17,7 +17,7 @@ Because links point at names rather than paths, you can move a file and update o
 
 ## Installation
 
-Requires Rust 1.79 or newer (`std::path::absolute`). Unix-like systems only for now, since `~` expansion relies on `$HOME`.
+Requires Rust 1.85 or newer (`std::path::absolute`). Unix-like systems only for now, since `~` expansion relies on `$HOME`.
 
 ```
 git clone https://github.com/toyo54/flink.git
